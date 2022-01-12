@@ -45,9 +45,6 @@ site %>%
 # remove duplicated
 site <- unique(site)
 
-# check repeated pid
-rep <- site$pid[which(table(site$pid)>1)]#############################################################
-site[which(rep %in% site$pid),]
 
 #
 # Horizon description ----------------------------------------------------------
@@ -203,39 +200,76 @@ write_csv(hor, "data_output/horizon.csv")
 ################################################################################
 library(aqp)
 library(sf)
+library(sp)
 library(mapview)
 
+# Load site and horizon data ---------------------------------------------------
 site <- read_csv("data_output/site.csv")
 hor <-  read_csv("data_output/horizon.csv")
 
+# Check locations ----------------------------------------------------- 
 # https://epsg.io/6204
 site %>% 
-  st_as_sf(coords = c("x", "y"), crs = 6204) %>% 
-  mapview()
+  st_as_sf(coords = c("x", "y"), crs = 6204) %>% # convert to spatial object
+  mapview() # visualise in an interactive map
+
+# repeated locations
 x <- site %>% 
   st_as_sf(coords = c("x", "y"), crs = 6204)  
+# evaluate which sites are at zero distance
 sp::zerodist(as_Spatial(x))
 
+# identify the profiles
+x <- x[sp::zerodist(as_Spatial(x)) %>% as.vector(),] %>% 
+  st_drop_geometry()
 
+# List of pid
+x$pid[x$pid %>% order()]
+unique(x$pid)
 
+# Convert data into a Soil Profile Collection ----------------------------------
 depths(hor) <- pid ~ top + bottom
-site(hor) <- site
-aqp::coordinates(x) <- ~x+y
-aqp::proj4string(x) <- "+proj=lcc +lat_1=48 +lat_2=33 +lon_0=-100 +datum=WGS84"
+site(hor) <- left_join(site(hor), site)
+profiles <- hor
 
-aqp::checkSPC(x)
-aqp::checkHzDepthLogic(x)
-aqp::fillHzGaps(x)
+profiles
 
-#### Spline
+# aqp::coordinates(x) <- ~x+y
+# aqp::proj4string(x) <- "+proj=tmerc +lat_0=0 +lon_0=21 +k=0.9999 +x_0=500000 +y_0=0 +ellps=bessel +towgs84=682,-203,480,0,0,0,0 +units=m +no_defs "
 
-z <- aqp::spc2mpspline(x, var_name = "clay", hzdesgn = "n", d = c(0, 50))
-plotSPC(z, color = "clay_spline", divide.hz = FALSE )
+# plot first 20 profiles using pH as color
+plotSPC(x = profiles[1:20], name = "hor_mk", color = "ph_h2o")
 
-z@horizons %>% group_by(idp) %>% summarise(meanClay = mean(clay_splain, na.rm=T))
-##### 
-s <- aqp::slab(x, 
-               fm = ~ clay + sand + ph + oc,
+# check data integrity
+# A valid profile is TRUE if all of the following criteria are false:
+#    + depthLogic : boolean, errors related to depth logic
+#    + sameDepth : boolean, errors related to same top/bottom depths
+#    + missingDepth : boolean, NA in top / bottom depths
+#    + overlapOrGap : boolean, gaps or overlap in adjacent horizons
+aqp::checkHzDepthLogic(profiles)
+# get only non valid profiles
+aqp::checkHzDepthLogic(profiles ) %>% 
+  filter(valid == FALSE) 
+# visualize some of these profiles by the pid
+subset(profiles, grepl("P0142", pid, ignore.case = TRUE))
+subset(profiles, grepl("P0494", pid, ignore.case = TRUE))
+subset(profiles, grepl("P3847", pid, ignore.case = TRUE))
+
+
+# keep only valid profiles -----------------------------------------------------
+clean_prof <- HzDepthLogicSubset(profiles)
+metadata(clean_prof)$removed.profiles
+
+# Save clean data --------------------------------------------------------------
+# first, we save the soilProfileCollection object
+saveRDS(clean_prof, file = "data_output/profiles.RData")
+# now, split the SPC to have horizon data and site data 
+write_csv(clean_prof@horizons, "clean_horizons.csv")
+write_csv(clean_prof@site, "clean_site.csv")
+
+# graphical inspections & descriptive statistics ===============================
+s <- aqp::slab(clean_prof, 
+               fm = ~ clay + sand + ph_h2o + humus,
                slab.structure = 0:100,
                slab.fun = function(x) quantile(x, c(0.01, 0.5, 0.99), na.rm = TRUE))
 
@@ -250,4 +284,34 @@ ggplot(s, aes(x = top, y = X50.)) +
   coord_flip() +
   facet_wrap(~ variable, scales = "free_x")
 
+# Names
+names(clean_prof@horizons)
 
+# function to detect outliers
+is_outlier <- function(x) {
+  return(x < quantile(x, probs = 0.05, na.rm = TRUE) - 1.5 * IQR(x, na.rm = TRUE) |
+           x > quantile(x, probs = 0.95, na.rm = TRUE) + 1.5 * IQR(x, na.rm = TRUE))
+}
+
+# identify outliers for all soil properties
+clean_prof@horizons %>%
+  mutate_at(.vars = 9:34,.funs = function(y) ifelse(is_outlier(y), y, as.numeric(NA))) 
+  
+# create a table to review suspicious values (pay attention to the steps)
+
+# 1. select horizon table from clean_prof
+suspicious <- clean_prof@horizons %>% 
+  # 2. keep only outliers for each soil property (columns 9 to 34)
+  mutate_at(.vars = 9:34,.funs = function(y) ifelse(is_outlier(y), y, as.numeric(NA))) %>% 
+  # 3. define key columns (profil id and horizon id)
+  group_by(pid, hid) %>% 
+  # 4. select soil properties (from:to)
+  select(caco3:sand) %>% 
+  # 5. pivot table from wide to long
+  pivot_longer(cols = caco3:sand) %>% 
+  # 6. remove missing values (NAs)
+  na.omit()
+
+suspicious
+
+write_csv(suspicious, "data_output/suspicious.csv")
